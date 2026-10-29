@@ -1,0 +1,46 @@
+name: Buscar errores de precio
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: buscar-errores-precio
+  cancel-in-progress: false
+
+jobs:
+  buscar:
+    # El cron no hace nada (ni gasta minutos) hasta que crees la variable
+    # BOT_ACTIVO=true en Settings → Secrets and variables → Actions → Variables.
+    # Lanzarlo a mano con "Run workflow" funciona siempre.
+    if: vars.BOT_ACTIVO == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recuperar productos ya avisados
+        uses: actions/cache/restore@v4
+        with:
+          path: estado
+          key: vistos-${{ github.run_id }}
+          restore-keys: vistos-
+
+      - name: Buscar y avisar
+        run: python3 bot.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DESCUENTO_MIN: ${{ vars.DESCUENTO_MIN }}
+          PRECIO_MIN: ${{ vars.PRECIO_MIN }}
+          TIENDAS: ${{ vars.TIENDAS }}
+          PAGINAS: ${{ vars.PAGINAS }}
+          MAX_AVISOS: ${{ vars.MAX_AVISOS }}
+
+      - name: Guardar productos ya avisados
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: estado
+          key: vistos-${{ github.run_id }}-${{ github.run_attempt }}
