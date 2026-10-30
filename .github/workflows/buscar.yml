@@ -4,7 +4,7 @@ on:
   schedule:
     # De 7:00 a 23:55 UTC, que cubre de 9:00 a 1:00 en Madrid en invierno y en verano.
     # La hora exacta la comprueba el bot (PAUSA_NOCHE).
-    - cron: "*/5 7-23 * * *"
+    - cron: "3-58/5 7-23 * * *"
   workflow_dispatch:
 
 concurrency:
