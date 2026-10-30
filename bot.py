@@ -1,14 +1,13 @@
 """Bot de errores de precio: vigila las tiendas directamente y avisa por Telegram.
 
 En cada búsqueda lee páginas de ofertas y categorías de cada tienda (tiendas/),
-guarda el historial de precios de cada producto y avisa cuando:
-  * un producto que ya conoce baja al menos un DESCUENTO_MIN % por debajo de su
-    precio medio, o
-  * aparece o baja un producto que todavía no tiene historial y está al menos un
-    DESCUENTO_MIN_TACHADO % por debajo del precio tachado de la propia tienda.
+guarda el historial de precios de cada producto y avisa cuando un producto baja
+al menos un DESCUENTO_MIN % por debajo de su precio medio de los últimos 99 días.
+El precio tachado que enseña la tienda no cuenta: solo el historial propio.
 
-La primera vez que lee una página solo apunta los precios, sin avisar: así no
-salta con todo lo que ya estaba rebajado.
+Ignora los productos que no compensa revender: ropa, muebles y otros
+voluminosos, reacondicionados o usados, y los que de media valen menos de
+PRECIO_MIN.
 
 Uso:
     python3 bot.py                  # una búsqueda (lo que hace GitHub Actions)
@@ -24,8 +23,10 @@ import html
 import http.client
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -36,11 +37,30 @@ import tiendas
 
 NAVEGADOR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 PAUSA_ENTRE_PAGINAS = 1.5  # segundos entre dos peticiones a la misma tienda
-MAX_OBSERVACIONES = 50  # la media pesa como mucho las últimas ~50 lecturas
-MIN_OBSERVACIONES = 3  # lecturas necesarias para fiarse de la media propia
+DIAS_MEDIA = 99  # periodo de la media de precio
 BAJADA_MINIMA = 0.97  # solo cuenta si el precio cae al menos un 3 % desde la última lectura
 HORAS_SIN_REPETIR = 72  # no repetir el aviso de un producto salvo que baje otro 5 %
-DIAS_OLVIDO = 30  # productos y páginas que no se ven en este tiempo se borran
+DIAS_OLVIDO = 30  # productos que no se ven en este tiempo se borran
+
+# Productos que no compensa revender. Se comparan sin tildes ni mayúsculas.
+EXCLUIDOS = [
+    # ropa y calzado
+    r"camisetas?", r"camisas?", r"pantalon(es)?", r"chaquetas?", r"abrigos?", r"sudaderas?", r"jerseys?",
+    r"vestidos?", r"faldas?", r"leggings?", r"calcetines", r"pijamas?", r"banadores?", r"sujetador(es)?",
+    r"calzoncillos?", r"bragas?", r"chalecos?", r"cazadoras?", r"parkas?", r"blusas?", r"chandal",
+    r"bufandas?", r"gorros?", r"zapatillas de (casa|estar por casa)", r"ropa",
+    # muebles y voluminosos
+    r"sofas?", r"sillon(es)?", r"armarios?", r"comodas?", r"colchon(es)?", r"canapes?", r"somier",
+    r"literas?", r"cabeceros?", r"estanterias?", r"aparador(es)?", r"zapateros?", r"recibidor(es)?",
+    r"chaise longue", r"mesa (de )?(comedor|centro|auxiliar|escritorio|noche|jardin)", r"mesitas?",
+    r"escritorios?", r"sillas?",
+    # reacondicionados y usados
+    r"reacondicionad[oa]s?", r"renovad[oa]s?", r"segunda mano", r"usad[oa]s?", r"open ?box",
+]
+
+
+def sin_tildes(texto):
+    return "".join(c for c in unicodedata.normalize("NFD", texto.lower()) if unicodedata.category(c) != "Mn")
 
 
 @dataclass
@@ -48,11 +68,12 @@ class Config:
     telegram_token: str = ""
     telegram_chat: str = ""
     descuento_min: int = 50
-    descuento_min_tachado: int = 70
     precio_min: float = 30.0
+    horas_min_historial: int = 24
     tiendas: list = field(default_factory=list)  # vacía = todas
+    excluir: list = field(default_factory=list)  # palabras extra a ignorar
     max_avisos: int = 15
-    estado: Path = Path("estado/historial.json")
+    estado: Path = Path("estado/historial99.json")
 
     @classmethod
     def desde_entorno(cls):
@@ -60,16 +81,24 @@ class Config:
             # En Actions una variable sin definir llega como cadena vacía.
             return os.environ.get(nombre) or defecto
 
+        def lista(nombre):
+            return [t.strip().lower() for t in env(nombre).split(",") if t.strip()]
+
         return cls(
             telegram_token=env("TELEGRAM_BOT_TOKEN"),
             telegram_chat=env("TELEGRAM_CHAT_ID"),
             descuento_min=int(env("DESCUENTO_MIN", "50")),
-            descuento_min_tachado=int(env("DESCUENTO_MIN_TACHADO", "70")),
             precio_min=float(env("PRECIO_MIN", "30")),
-            tiendas=[t.strip().lower() for t in env("TIENDAS").split(",") if t.strip()],
+            horas_min_historial=int(env("HORAS_MIN_HISTORIAL", "24")),
+            tiendas=lista("TIENDAS"),
+            excluir=lista("EXCLUIR"),
             max_avisos=int(env("MAX_AVISOS", "15")),
-            estado=Path(env("ARCHIVO_ESTADO", "estado/historial.json")),
+            estado=Path(env("ARCHIVO_ESTADO", "estado/historial99.json")),
         )
+
+    def patron_excluidos(self):
+        palabras = EXCLUIDOS + [re.escape(sin_tildes(p)) for p in self.excluir]
+        return re.compile(r"\b(" + "|".join(palabras) + r")\b")
 
 
 # --- Red ---------------------------------------------------------------------
@@ -98,7 +127,7 @@ def pedir(url, datos=None):
 @dataclass
 class Lectura:
     tienda: str
-    productos: list = field(default_factory=list)  # (página, Producto)
+    productos: list = field(default_factory=list)
     paginas: list = field(default_factory=list)
     errores: list = field(default_factory=list)
 
@@ -120,7 +149,7 @@ def leer_tienda(modulo, estado_tienda, pausa=PAUSA_ENTRE_PAGINAS):
         if not encontrados:
             lectura.errores.append(f"{url}: 0 productos (¿ha cambiado la web?)")
         lectura.paginas.append(url)
-        lectura.productos.extend((url, p) for p in encontrados)
+        lectura.productos.extend(encontrados)
         return pagina
 
     for url in modulo.FIJAS:
@@ -138,26 +167,31 @@ def leer_tienda(modulo, estado_tienda, pausa=PAUSA_ENTRE_PAGINAS):
     return lectura
 
 
-# --- Detección ---------------------------------------------------------------
+# --- Historial y detección ---------------------------------------------------
 
-def evaluar(producto, previo, pagina_conocida, cfg):
-    """Devuelve (motivo, precio de referencia) si hay que avisar, o None."""
-    precio = producto.precio
-    if previo and previo["n"] >= MIN_OBSERVACIONES:
-        media = previo["m"]
-        if (media >= cfg.precio_min and precio < previo["u"] * BAJADA_MINIMA
-                and precio <= media * (1 - cfg.descuento_min / 100)):
-            return "media", media
+def media_periodo(historial, ahora):
+    """Precio medio ponderado por tiempo en los últimos DIAS_MEDIA días (o desde que se conoce)."""
+    inicio = max(historial["p0"], ahora - DIAS_MEDIA * 86400)
+    if ahora <= inicio:
         return None
-    # Sin historial suficiente: se compara con el precio tachado de la tienda.
-    tachado = producto.precio_ref
-    if not tachado or tachado < cfg.precio_min or precio > tachado * (1 - cfg.descuento_min_tachado / 100):
+    puntos = historial["h"]
+    total = 0.0
+    for i, (desde, precio) in enumerate(puntos):
+        hasta = puntos[i + 1][0] if i + 1 < len(puntos) else ahora
+        total += precio * max(0, hasta - max(desde, inicio))
+    return total / (ahora - inicio)
+
+
+def evaluar(producto, previo, cfg, ahora):
+    """Devuelve la media de 99 días si el producto acaba de caer por debajo del umbral, o None."""
+    if not previo or ahora - previo["p0"] < cfg.horas_min_historial * 3600:
         return None
-    if previo is None and not pagina_conocida:
-        return None  # primera lectura de la página: ya estaba así, no es nuevo
-    if previo is not None and precio >= previo["u"] * BAJADA_MINIMA:
-        return None  # ya lo habíamos visto a este precio
-    return "tachado", tachado
+    if producto.precio >= previo["u"] * BAJADA_MINIMA:
+        return None  # no ha bajado desde la última lectura
+    media = media_periodo(previo, ahora)
+    if not media or media < cfg.precio_min or producto.precio > media * (1 - cfg.descuento_min / 100):
+        return None
+    return media
 
 
 def ya_avisado(previo, precio, ahora):
@@ -166,10 +200,17 @@ def ya_avisado(previo, precio, ahora):
 
 
 def actualizar(previo, precio, ahora):
+    """Apunta el precio. El historial guarda solo los cambios: [[momento, precio], ...]."""
+    ahora = int(ahora)
     if previo is None:
-        return {"m": precio, "n": 1, "u": precio, "t": ahora}
-    n = min(previo["n"] + 1, MAX_OBSERVACIONES)
-    previo.update(m=round(previo["m"] + (precio - previo["m"]) / n, 2), n=n, u=precio, t=ahora)
+        return {"h": [[ahora, precio]], "u": precio, "p0": ahora, "t": ahora}
+    if precio != previo["u"]:
+        previo["h"].append([ahora, precio])
+    # Se borra lo anterior a 99 días, dejando el último punto como precio al inicio del periodo.
+    limite = ahora - DIAS_MEDIA * 86400
+    while len(previo["h"]) > 1 and previo["h"][1][0] <= limite:
+        previo["h"].pop(0)
+    previo.update(u=precio, t=ahora)
     return previo
 
 
@@ -183,23 +224,24 @@ def descuento(precio, referencia):
     return (referencia - precio) * 100 / referencia
 
 
-def mensaje(producto, motivo, referencia):
-    origen = "media vista por el bot" if motivo == "media" else "precio tachado de la tienda"
+def mensaje(producto, media, previo, ahora):
+    dias = min(DIAS_MEDIA, (ahora - previo["p0"]) / 86400)
+    periodo = f"{DIAS_MEDIA} días" if dias >= DIAS_MEDIA else f"{dias:.0f} días de historial" if dias >= 1.5 else "1 día de historial"
     return "\n".join([
-        f"🚨 <b>-{descuento(producto.precio, referencia):.0f}%</b> · {html.escape(producto.titulo[:200])}",
+        f"🚨 <b>-{descuento(producto.precio, media):.0f}%</b> · {html.escape(producto.titulo[:200])}",
         "",
         f"🏪 {html.escape(producto.tienda)}",
-        f"💶 Ahora: <b>{formatear_precio(producto.precio)}</b>",
-        f"📊 Antes: {formatear_precio(referencia)} ({origen})",
-        f"💰 Ahorro: {formatear_precio(referencia - producto.precio)}",
+        f"💶 Ahora: <b>{formatear_precio(producto.precio)}</b> (antes {formatear_precio(previo['u'])})",
+        f"📊 Precio medio: {formatear_precio(media)} ({periodo})",
+        f"💰 Ahorro: {formatear_precio(media - producto.precio)}",
         f"🔗 {html.escape(producto.url)}",
     ])
 
 
 def resumen_extra(avisos):
     lineas = [f"➕ <b>{len(avisos)} avisos más</b>"]
-    for producto, _, referencia in avisos:
-        lineas.append(f"• -{descuento(producto.precio, referencia):.0f}% {html.escape(producto.titulo[:60])} "
+    for producto, media in avisos:
+        lineas.append(f"• -{descuento(producto.precio, media):.0f}% {html.escape(producto.titulo[:60])} "
                       f"({html.escape(producto.tienda)}, {formatear_precio(producto.precio)}) {html.escape(producto.url)}")
     texto = "\n".join(lineas)
     return texto if len(texto) < 4000 else texto[:3990] + "…"
@@ -228,7 +270,6 @@ def cargar_estado(ruta, ahora):
     limite = ahora - DIAS_OLVIDO * 86400
     return {
         "productos": {k: v for k, v in estado.get("productos", {}).items() if v.get("t", 0) >= limite},
-        "paginas": {k: t for k, t in estado.get("paginas", {}).items() if t >= limite},
         "tiendas": estado.get("tiendas", {}),
     }
 
@@ -253,32 +294,35 @@ def ejecutar(cfg, simular=False):
         lecturas = list(hilos.map(
             lambda m: leer_tienda(m, estado["tiendas"].setdefault(m.NOMBRE, {})), modulos))
 
+    excluidos = cfg.patron_excluidos()
     productos = estado["productos"]
     candidatos = []
     for lectura in lecturas:
-        vistos = set()
-        nuevos = 0
-        for pagina, producto in lectura.productos:
+        vistos, nuevos, ignorados = set(), 0, 0
+        for producto in lectura.productos:
             if producto.clave in vistos or not producto.precio:
                 continue
             vistos.add(producto.clave)
+            if excluidos.search(sin_tildes(producto.titulo)):
+                ignorados += 1
+                productos.pop(producto.clave, None)
+                continue
             previo = productos.get(producto.clave)
             nuevos += previo is None
-            resultado = evaluar(producto, previo, simular or pagina in estado["paginas"], cfg)
-            if resultado and not ya_avisado(previo, producto.precio, ahora):
-                candidatos.append((producto, *resultado))
+            media = evaluar(producto, previo, cfg, ahora)
+            if media and not ya_avisado(previo, producto.precio, ahora):
+                candidatos.append((producto, media, dict(previo, h=list(previo["h"]))))
             productos[producto.clave] = actualizar(previo, producto.precio, ahora)
-        for pagina in lectura.paginas:
-            estado["paginas"][pagina] = ahora
-        print(f"{lectura.tienda}: {len(lectura.paginas)} páginas, {len(vistos)} productos ({nuevos} nuevos)")
+        print(f"{lectura.tienda}: {len(lectura.paginas)} páginas, {len(vistos)} productos "
+              f"({nuevos} nuevos, {ignorados} ignorados por tipo)")
         for error in lectura.errores:
             print(f"  ⚠️ {error}", file=sys.stderr)
 
-    candidatos.sort(key=lambda c: descuento(c[0].precio, c[2]), reverse=True)
+    candidatos.sort(key=lambda c: descuento(c[0].precio, c[1]), reverse=True)
     enviados = 0
     try:
-        for producto, motivo, referencia in candidatos[:cfg.max_avisos]:
-            texto = mensaje(producto, motivo, referencia)
+        for producto, media, previo in candidatos[:cfg.max_avisos]:
+            texto = mensaje(producto, media, previo, ahora)
             if simular:
                 print("\n" + texto)
             else:
@@ -288,9 +332,9 @@ def ejecutar(cfg, simular=False):
                     print(f"No se pudo avisar de {producto.clave}: {e}", file=sys.stderr)
                     continue
                 time.sleep(0.5)
-            productos[producto.clave].update(av=producto.precio, at=ahora)
+            productos[producto.clave].update(av=producto.precio, at=int(ahora))
             enviados += 1
-        sobrantes = candidatos[cfg.max_avisos:]
+        sobrantes = [(p, m) for p, m, _ in candidatos[cfg.max_avisos:]]
         if sobrantes:
             texto = resumen_extra(sobrantes)
             if simular:
@@ -300,8 +344,8 @@ def ejecutar(cfg, simular=False):
                     enviar_telegram(cfg, texto)
                 except RuntimeError as e:
                     print(f"No se pudo mandar el resumen: {e}", file=sys.stderr)
-            for producto, _, _ in sobrantes:
-                productos[producto.clave].update(av=producto.precio, at=ahora)
+            for producto, _ in sobrantes:
+                productos[producto.clave].update(av=producto.precio, at=int(ahora))
     finally:
         if not simular:
             guardar_estado(cfg.estado, estado)

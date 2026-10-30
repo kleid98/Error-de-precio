@@ -7,6 +7,6 @@
     descubrir(html) (opcional) -> más páginas para ROTAR, sacadas de las FIJAS
 """
 
-from . import conforama, druni, game, ikea, ldlc, lidl, miravia, tiendanimal, xtralife
+from . import druni, game, ldlc, lidl, tiendanimal, xtralife
 
-TODAS = [ldlc, game, xtralife, druni, lidl, ikea, conforama, tiendanimal, miravia]
+TODAS = [ldlc, game, xtralife, druni, lidl, tiendanimal]

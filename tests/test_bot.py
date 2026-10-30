@@ -8,55 +8,77 @@ from unittest import mock
 import bot
 from tiendas.base import Producto, numero
 
+DIA = 86400
 AHORA = 1_800_000_000
 
 
-def producto(precio, ref=None, id_="1", tienda="Prueba"):
-    return Producto(tienda, id_, "Consola <X>", precio, f"https://tienda.test/{id_}", precio_ref=ref)
+def producto(precio, ref=None, id_="1", titulo="Consola <X>"):
+    return Producto("Prueba", id_, titulo, precio, f"https://tienda.test/{id_}", precio_ref=ref)
 
 
-def historial(media, ultimo=None, n=10):
-    return {"m": media, "n": n, "u": ultimo or media, "t": AHORA - 300}
+def historial(*puntos):
+    """puntos: (días atrás, precio) en orden cronológico."""
+    h = [[AHORA - dias * DIA, precio] for dias, precio in puntos]
+    return {"h": h, "u": h[-1][1], "p0": h[0][0], "t": AHORA - 300}
+
+
+class Media(unittest.TestCase):
+    def test_media_ponderada_por_tiempo(self):
+        # 45 días a 100 € y los últimos 45 a 200 €
+        self.assertAlmostEqual(bot.media_periodo(historial((90, 100), (45, 200)), AHORA), 150)
+
+    def test_solo_cuentan_los_ultimos_99_dias(self):
+        # Hace 200 días valía 1000 €, pero desde hace 150 vale 100 €
+        self.assertAlmostEqual(bot.media_periodo(historial((200, 1000), (150, 100)), AHORA), 100)
+
+    def test_actualizar_guarda_solo_cambios_y_poda(self):
+        h = bot.actualizar(None, 100, AHORA - 200 * DIA)
+        bot.actualizar(h, 100, AHORA - 150 * DIA)
+        self.assertEqual(len(h["h"]), 1)
+        bot.actualizar(h, 80, AHORA - 120 * DIA)
+        bot.actualizar(h, 90, AHORA)
+        # El punto de hace 200 días se borra; el de hace 120 queda como precio al inicio del periodo.
+        self.assertEqual(h["h"], [[AHORA - 120 * DIA, 80], [AHORA, 90]])
+        self.assertEqual((h["u"], h["p0"]), (90, AHORA - 200 * DIA))
 
 
 class Deteccion(unittest.TestCase):
     def setUp(self):
-        self.cfg = bot.Config(descuento_min=50, descuento_min_tachado=70, precio_min=30)
+        self.cfg = bot.Config(descuento_min=50, precio_min=30, horas_min_historial=24)
 
-    def test_bajada_respecto_a_la_media(self):
-        self.assertEqual(bot.evaluar(producto(50), historial(100), True, self.cfg), ("media", 100))
-        self.assertIsNone(bot.evaluar(producto(51), historial(100), True, self.cfg))
+    def test_avisa_al_caer_un_50_por_ciento_bajo_la_media(self):
+        previo = historial((90, 100))
+        self.assertAlmostEqual(bot.evaluar(producto(50), previo, self.cfg, AHORA), 100)
+        self.assertIsNone(bot.evaluar(producto(51), previo, self.cfg, AHORA))
 
-    def test_media_exige_que_el_precio_acabe_de_bajar(self):
-        self.assertIsNone(bot.evaluar(producto(50), historial(100, ultimo=50), True, self.cfg))
+    def test_ignora_el_precio_tachado(self):
+        self.assertIsNone(bot.evaluar(producto(10, ref=1000), None, self.cfg, AHORA))
+        self.assertIsNone(bot.evaluar(producto(60, ref=1000), historial((90, 100)), self.cfg, AHORA))
 
-    def test_media_respeta_el_precio_minimo(self):
-        self.assertIsNone(bot.evaluar(producto(5), historial(20), True, self.cfg))
+    def test_exige_historial_minimo(self):
+        self.assertIsNone(bot.evaluar(producto(40), historial((0.5, 100)), self.cfg, AHORA))
+        self.assertIsNotNone(bot.evaluar(producto(40), historial((1.5, 100)), self.cfg, AHORA))
 
-    def test_producto_nuevo_contra_precio_tachado(self):
-        self.assertEqual(bot.evaluar(producto(30, ref=100), None, True, self.cfg), ("tachado", 100))
-        self.assertIsNone(bot.evaluar(producto(31, ref=100), None, True, self.cfg))
-        self.assertIsNone(bot.evaluar(producto(30), None, True, self.cfg))
+    def test_exige_que_acabe_de_bajar(self):
+        self.assertIsNone(bot.evaluar(producto(40), historial((90, 100), (1, 40)), self.cfg, AHORA))
 
-    def test_primera_lectura_de_una_pagina_no_avisa(self):
-        self.assertIsNone(bot.evaluar(producto(30, ref=100), None, False, self.cfg))
-
-    def test_poco_historial_usa_tachado_solo_si_baja(self):
-        poco = historial(30, n=1)
-        self.assertIsNone(bot.evaluar(producto(30, ref=100), poco, True, self.cfg))
-        self.assertEqual(bot.evaluar(producto(20, ref=100), poco, True, self.cfg), ("tachado", 100))
+    def test_respeta_el_precio_minimo(self):
+        self.assertIsNone(bot.evaluar(producto(5), historial((90, 20)), self.cfg, AHORA))
 
     def test_no_repite_avisos(self):
-        previo = dict(historial(100), av=50, at=AHORA - 3600)
+        previo = dict(historial((90, 100)), av=50, at=AHORA - 3600)
         self.assertTrue(bot.ya_avisado(previo, 49, AHORA))
         self.assertFalse(bot.ya_avisado(previo, 45, AHORA))
-        self.assertFalse(bot.ya_avisado(dict(previo, at=AHORA - 4 * 86400), 49, AHORA))
+        self.assertFalse(bot.ya_avisado(dict(previo, at=AHORA - 4 * DIA), 49, AHORA))
 
-    def test_media_movil(self):
-        h = bot.actualizar(None, 100, AHORA)
-        self.assertEqual(h, {"m": 100, "n": 1, "u": 100, "t": AHORA})
-        bot.actualizar(h, 50, AHORA)
-        self.assertEqual((h["m"], h["n"], h["u"]), (75, 2, 50))
+    def test_excluye_tipos_de_producto(self):
+        patron = bot.Config(excluir=["Funko"]).patron_excluidos()
+        for titulo in ["Chaqueta de esquí para mujer", "Sofá cama LUCY", "Armario MOKARIS",
+                       "Portátil ASUS reacondicionado", "Silla gaming", "Pantalón", "FUNKO Pop Batman"]:
+            self.assertTrue(patron.search(bot.sin_tildes(titulo)), titulo)
+        for titulo in ["PlayStation 5 Slim", "Juego de mesa Catan", "LEGO Star Wars", "Dior Sauvage",
+                       "PARKSIDE Taladro", "Tarjeta gráfica RTX 5070"]:
+            self.assertFalse(patron.search(bot.sin_tildes(titulo)), titulo)
 
 
 class Utilidades(unittest.TestCase):
@@ -66,11 +88,12 @@ class Utilidades(unittest.TestCase):
             self.assertEqual(numero(texto), valor, texto)
 
     def test_mensaje(self):
-        texto = bot.mensaje(producto(1299.99, ref=5000), "tachado", 5000)
+        texto = bot.mensaje(producto(1299.99), 5000, historial((30, 5000)), AHORA)
         self.assertIn("-74%", texto)
         self.assertIn("1.299,99 €", texto)
         self.assertIn("Consola &lt;X&gt;", texto)
-        self.assertIn("precio tachado de la tienda", texto)
+        self.assertIn("30 días de historial", texto)
+        self.assertIn("99 días", bot.mensaje(producto(10), 50, historial((120, 50)), AHORA))
 
 
 def tienda_falsa(paginas):
@@ -93,10 +116,9 @@ class Busqueda(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_rotacion_de_paginas(self):
-        modulo = tienda_falsa({})
         estado = {}
         with mock.patch.object(bot, "pedir", side_effect=lambda url: url):
-            leidas = [bot.leer_tienda(modulo, estado, pausa=0).paginas for _ in range(3)]
+            leidas = [bot.leer_tienda(tienda_falsa({}), estado, pausa=0).paginas for _ in range(3)]
         self.assertEqual(leidas, [["fija", "r1", "r2"], ["fija", "r3", "r1"], ["fija", "r2", "r3"]])
 
     def test_errores_de_red_no_paran_la_tienda(self):
@@ -109,29 +131,25 @@ class Busqueda(unittest.TestCase):
         self.assertEqual(lectura.paginas, ["fija", "r2"])
         self.assertTrue(any("HTTP 503" in e for e in lectura.errores))
 
-    def test_primera_vuelta_en_silencio_y_luego_avisa(self):
-        paginas = {"fija": [producto(40, ref=100, id_="a")]}
-        modulo = tienda_falsa(paginas)
-        with mock.patch.object(bot.tiendas, "TODAS", [modulo]), \
+    def test_avisa_solo_con_historial_y_una_vez(self):
+        paginas = {"fija": [producto(100, ref=500, id_="a"), producto(100, id_="b", titulo="Sofá cama")]}
+        reloj = [AHORA]
+        with mock.patch.object(bot.tiendas, "TODAS", [tienda_falsa(paginas)]), \
              mock.patch.object(bot, "pedir", side_effect=lambda url: url), \
              mock.patch.object(bot, "enviar_telegram") as enviar, \
-             mock.patch.object(bot, "PAUSA_ENTRE_PAGINAS", 0), \
+             mock.patch.object(bot.time, "time", side_effect=lambda: reloj[0]), \
              mock.patch.object(bot.time, "sleep"):
-            bot.ejecutar(self.cfg)  # indexa sin avisar
-            paginas["fija"] = [producto(40, ref=100, id_="a"), producto(20, ref=100, id_="b")]
-            bot.ejecutar(self.cfg)  # "b" es nuevo y está a -80 % del tachado
-            bot.ejecutar(self.cfg)  # no se repite
-            for _ in range(3):
-                bot.ejecutar(self.cfg)  # "a" acumula historial a 40 €
-            paginas["fija"][0] = producto(15, ref=100, id_="a")
-            bot.ejecutar(self.cfg)  # "a" cae un 62 % respecto a su media
-        avisos = [c.args[1] for c in enviar.call_args_list]
-        self.assertEqual(len(avisos), 2)
-        self.assertIn("-80%", avisos[0])
-        self.assertIn("precio tachado", avisos[0])
-        self.assertIn("media vista por el bot", avisos[1])
+            bot.ejecutar(self.cfg)                       # apunta "a" a 100 €; el sofá se ignora
+            reloj[0] += 2 * DIA
+            paginas["fija"] = [producto(45, id_="a"), producto(10, id_="b", titulo="Sofá cama")]
+            bot.ejecutar(self.cfg)                       # "a" cae un 55 %: aviso
+            reloj[0] += 600
+            bot.ejecutar(self.cfg)                       # sigue igual: no se repite
+        self.assertEqual(enviar.call_count, 1)
+        self.assertIn("-55%", enviar.call_args.args[1])
         estado = json.loads(self.cfg.estado.read_text())
-        self.assertEqual(estado["productos"]["Prueba:a"]["av"], 15)
+        self.assertEqual(set(estado["productos"]), {"Prueba:a"})
+        self.assertEqual(estado["productos"]["Prueba:a"]["av"], 45)
 
 
 if __name__ == "__main__":
