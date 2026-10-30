@@ -81,6 +81,28 @@ class Deteccion(unittest.TestCase):
             self.assertFalse(patron.search(bot.sin_tildes(titulo)), titulo)
 
 
+class Pausa(unittest.TestCase):
+    def test_pausa_nocturna(self):
+        cfg = bot.Config(pausa=(1, 9))
+        horas = {h: cfg.en_pausa(bot.datetime(2026, 1, 1, h, 30)) for h in range(24)}
+        self.assertEqual([h for h, pausa in horas.items() if pausa], list(range(1, 9)))
+
+    def test_pausa_que_cruza_medianoche(self):
+        cfg = bot.Config(pausa=(23, 7))
+        self.assertTrue(cfg.en_pausa(bot.datetime(2026, 1, 1, 23, 0)))
+        self.assertTrue(cfg.en_pausa(bot.datetime(2026, 1, 1, 3, 0)))
+        self.assertFalse(cfg.en_pausa(bot.datetime(2026, 1, 1, 7, 0)))
+
+    def test_sin_pausa(self):
+        self.assertFalse(bot.Config(pausa=None).en_pausa(bot.datetime(2026, 1, 1, 3, 0)))
+
+    def test_variable_de_entorno(self):
+        with mock.patch.dict("os.environ", {"PAUSA_NOCHE": "2-8"}):
+            self.assertEqual(bot.Config.desde_entorno().pausa, (2, 8))
+        with mock.patch.dict("os.environ", {"PAUSA_NOCHE": "no"}):
+            self.assertIsNone(bot.Config.desde_entorno().pausa)
+
+
 class Utilidades(unittest.TestCase):
     def test_numero(self):
         for texto, valor in [("1.299,95 €", 1299.95), ("54,95", 54.95), ("881.95", 881.95),

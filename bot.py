@@ -15,6 +15,7 @@ Uso:
     python3 bot.py --prueba         # mandar un mensaje de prueba a Telegram
     python3 bot.py --simular        # buscar y enseñar los avisos sin mandarlos ni guardar nada
     python3 bot.py --tienda LDLC    # solo esa tienda (se puede repetir)
+    python3 bot.py --sin-pausa      # buscar aunque sea la pausa nocturna (PAUSA_NOCHE, 1-9 h)
 """
 
 import argparse
@@ -31,7 +32,9 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import tiendas
 
@@ -73,6 +76,8 @@ class Config:
     tiendas: list = field(default_factory=list)  # vacía = todas
     excluir: list = field(default_factory=list)  # palabras extra a ignorar
     max_avisos: int = 15
+    pausa: tuple | None = (1, 9)  # (desde, hasta) en horas de ZONA_HORARIA; None = sin pausa
+    zona: str = "Europe/Madrid"
     estado: Path = Path("estado/historial99.json")
 
     @classmethod
@@ -84,6 +89,13 @@ class Config:
         def lista(nombre):
             return [t.strip().lower() for t in env(nombre).split(",") if t.strip()]
 
+        pausa = env("PAUSA_NOCHE", "1-9")
+        if pausa.lower() in ("0", "no"):
+            pausa = None
+        else:
+            desde, hasta = pausa.split("-")
+            pausa = (int(desde), int(hasta))
+
         return cls(
             telegram_token=env("TELEGRAM_BOT_TOKEN"),
             telegram_chat=env("TELEGRAM_CHAT_ID"),
@@ -93,8 +105,18 @@ class Config:
             tiendas=lista("TIENDAS"),
             excluir=lista("EXCLUIR"),
             max_avisos=int(env("MAX_AVISOS", "15")),
+            pausa=pausa,
+            zona=env("ZONA_HORARIA", "Europe/Madrid"),
             estado=Path(env("ARCHIVO_ESTADO", "estado/historial99.json")),
         )
+
+    def en_pausa(self, momento=None):
+        """True si la hora local cae en la pausa nocturna (p. ej. de 1:00 a 8:59 con (1, 9))."""
+        if not self.pausa:
+            return False
+        hora = (momento or datetime.now(ZoneInfo(self.zona))).hour
+        desde, hasta = self.pausa
+        return desde <= hora < hasta if desde < hasta else hora >= desde or hora < hasta
 
     def patron_excluidos(self):
         palabras = EXCLUIDOS + [re.escape(sin_tildes(p)) for p in self.excluir]
@@ -361,6 +383,7 @@ def main():
     parser.add_argument("--prueba", action="store_true", help="mandar un mensaje de prueba a Telegram y salir")
     parser.add_argument("--simular", action="store_true", help="enseñar los avisos sin mandarlos ni guardar nada")
     parser.add_argument("--tienda", action="append", default=[], help="buscar solo en esta tienda")
+    parser.add_argument("--sin-pausa", action="store_true", help="buscar aunque sea la pausa nocturna")
     args = parser.parse_args()
 
     cfg = Config.desde_entorno()
@@ -377,7 +400,16 @@ def main():
         print("Mensaje de prueba enviado.")
         return
 
+    if args.sin_pausa:
+        cfg.pausa = None
+
     while True:
+        if cfg.en_pausa():
+            print(f"Pausa nocturna ({cfg.pausa[0]}:00-{cfg.pausa[1]}:00, {cfg.zona}): no se busca.")
+            if not args.bucle:
+                break
+            time.sleep(args.bucle)
+            continue
         try:
             ejecutar(cfg, simular=args.simular)
         except RuntimeError as e:

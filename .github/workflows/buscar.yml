@@ -2,7 +2,9 @@ name: Buscar errores de precio
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # De 7:00 a 23:55 UTC, que cubre de 9:00 a 1:00 en Madrid en invierno y en verano.
+    # La hora exacta la comprueba el bot (PAUSA_NOCHE).
+    - cron: "*/5 7-23 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -28,7 +30,8 @@ jobs:
           restore-keys: historial99-
 
       - name: Buscar y avisar
-        run: python3 bot.py
+        # Lanzado a mano ("Run workflow") busca aunque sea de noche.
+        run: python3 bot.py ${{ github.event_name == 'workflow_dispatch' && '--sin-pausa' || '' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -38,6 +41,7 @@ jobs:
           TIENDAS: ${{ vars.TIENDAS }}
           EXCLUIR: ${{ vars.EXCLUIR }}
           MAX_AVISOS: ${{ vars.MAX_AVISOS }}
+          PAUSA_NOCHE: ${{ vars.PAUSA_NOCHE }}
 
       - name: Guardar historial de precios
         if: always()

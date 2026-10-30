@@ -58,6 +58,10 @@ Ajustes opcionales (pestaña Variables):
 | `EXCLUIR` | (nada) | Más palabras a ignorar, separadas por comas: `funko,peluche` |
 | `TIENDAS` | (todas) | Solo estas, separadas por comas: `LDLC,GAME,Druni` |
 | `MAX_AVISOS` | `15` | Mensajes con foto por búsqueda (el resto llega en un resumen) |
+| `PAUSA_NOCHE` | `1-9` | Horas (Madrid) en las que no busca; `no` para buscar siempre |
+
+De 1:00 a 9:00 (hora de Madrid) no se busca. Lanzado a mano con **Run workflow**
+busca a cualquier hora.
 
 El historial se guarda en la caché de GitHub Actions entre ejecuciones (solo los
 cambios de precio de cada producto, así que ocupa poco).
