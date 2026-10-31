@@ -40,6 +40,7 @@ import tiendas
 
 NAVEGADOR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 PAUSA_ENTRE_PAGINAS = 1.5  # segundos entre dos peticiones a la misma tienda
+MAX_SIN_RESPUESTA = 2  # tras estos fallos de red seguidos se deja la tienda para la próxima búsqueda
 DIAS_MEDIA = 99  # periodo de la media de precio
 BAJADA_MINIMA = 0.97  # solo cuenta si el precio cae al menos un 3 % desde la última lectura
 HORAS_SIN_REPETIR = 72  # no repetir el aviso de un producto salvo que baje otro 5 %
@@ -132,7 +133,7 @@ def pedir(url, datos=None):
         cabeceras["Content-Type"] = "application/json"
     peticion = urllib.request.Request(url, data=datos, headers=cabeceras)
     try:
-        with urllib.request.urlopen(peticion, timeout=30) as respuesta:
+        with urllib.request.urlopen(peticion, timeout=15) as respuesta:
             cuerpo = respuesta.read()
     except urllib.error.HTTPError as e:
         # El mensaje no incluye la URL para no filtrar el token de Telegram en los logs.
@@ -158,15 +159,25 @@ def leer_tienda(modulo, estado_tienda, pausa=PAUSA_ENTRE_PAGINAS):
     """Lee las páginas fijas y las siguientes de la rotación. Avanza el cursor en estado_tienda."""
     lectura = Lectura(modulo.NOMBRE)
     descubiertas = []
+    sin_respuesta = 0  # fallos de red seguidos
 
     def leer_pagina(url):
+        nonlocal sin_respuesta
+        # Si la tienda no contesta, cada página espera el timeout entero y la búsqueda se alarga minutos.
+        if sin_respuesta >= MAX_SIN_RESPUESTA:
+            return None
         if lectura.paginas or lectura.errores:
             time.sleep(pausa)
         try:
             pagina = pedir(url)
         except RuntimeError as e:
             lectura.errores.append(f"{url}: {e}")
+            if str(e).startswith("sin respuesta"):
+                sin_respuesta += 1
+                if sin_respuesta == MAX_SIN_RESPUESTA:
+                    lectura.errores.append(f"{modulo.NOMBRE} no responde; se deja para la próxima búsqueda")
             return None
+        sin_respuesta = 0
         encontrados = modulo.leer(pagina)
         if not encontrados:
             lectura.errores.append(f"{url}: 0 productos (¿ha cambiado la web?)")

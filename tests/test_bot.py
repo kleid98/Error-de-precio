@@ -153,6 +153,16 @@ class Busqueda(unittest.TestCase):
         self.assertEqual(lectura.paginas, ["fija", "r2"])
         self.assertTrue(any("HTTP 503" in e for e in lectura.errores))
 
+    def test_tienda_que_no_responde_se_deja(self):
+        pedidas = []
+        def pedir(url):
+            pedidas.append(url)
+            raise RuntimeError("sin respuesta (URLError)")
+        with mock.patch.object(bot, "pedir", side_effect=pedir):
+            lectura = bot.leer_tienda(tienda_falsa({}), {}, pausa=0)
+        self.assertEqual(pedidas, ["fija", "r1"])
+        self.assertTrue(any("no responde" in e for e in lectura.errores))
+
     def test_avisa_solo_con_historial_y_una_vez(self):
         paginas = {"fija": [producto(100, ref=500, id_="a"), producto(100, id_="b", titulo="Sofá cama")]}
         reloj = [AHORA]
